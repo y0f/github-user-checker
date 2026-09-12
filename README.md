@@ -1,7 +1,8 @@
 # github-user-checker
 
-Checks if GitHub username can really be registered. Go, zero deps. One proxy
-per request, own connection as fallback. Free names go to text file.
+Checks if GitHub username can really be registered. Go, zero deps. Every proxy
+runs its own workers off one shared queue, own connection joins at a rate
+limit. Free names go to text file.
 
 ## Why not 404
 
@@ -52,16 +53,18 @@ run again, resumes.
 | `-out` | `available.txt` | free names |
 | `-done` | `checked.txt` | resume log |
 | `-proxies` | `proxies.txt` | proxy list |
-| `-direct` | `true` | own connection when rotation cannot answer |
+| `-direct` | `true` | own connection joins the pool, rate limited |
 | `-direct-rate` | `30` | direct requests per minute, `0` unlimited |
-| `-workers` | `64` | concurrent checks |
-| `-tries` | `8` | proxy attempts per name before fallback |
-| `-max-fails` | `4` | consecutive fails before proxy retired |
+| `-per-proxy` | `4` | concurrent requests through each proxy |
+| `-tries` | `8` | failures from proven proxies (or `429`s) per name before giving up |
+| `-backoff` | `10s` | pause after a proxy fails, doubles each failure in a row |
+| `-max-backoff` | `10m` | longest pause for a failing proxy |
+| `-limit-pause` | `20s` | pause for a proxy GitHub answered `429` to |
 | `-reload` | `2m` | re-read proxy list this often, `0` off |
 | `-min` / `-max` | `2` / `8` | name length filter |
 | `-letters` | `true` | keep only `a-z` |
 | `-confirm` | `true` | re-check hits via second route |
-| `-timeout` | `12s` | per request |
+| `-timeout` | `8s` | per request |
 | `-debug` | `false` | print why each attempt rejected |
 
 ## Proxies
@@ -82,8 +85,10 @@ Two rules:
 
 - **Proxy must CONNECT to https.** GitHub is TLS. Lists validated against
   plain-http target fail every request.
-- **Free proxies die in hours.** Mostly `gaveup` → rebuild list. `-reload`
-  picks up new file mid-run.
+- **Free proxies die in hours.** Dead proxy never retired, only paused:
+  `-backoff` doubling per failure up to `-max-backoff`, then probed again.
+  Fast proxies pull most names, dead ones cost only their own time. `-reload`
+  picks up new entries mid-run.
 
 No list, or all dead → run continues direct at `-direct-rate`. Slow on purpose.
 One address, nothing behind it.

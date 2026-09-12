@@ -16,22 +16,31 @@ import (
 	"time"
 )
 
-// Pool hands out one proxy per request, round robin, and retires a proxy once
-// it has failed maxFails times in a row.
+// Pool owns every proxy. Each proxy runs its own workers, so a fast proxy
+// answers many names while a dead one only wastes its own time. A proxy that
+// fails is paused with exponential backoff and probed again later; nothing is
+// ever retired for good.
 type Pool struct {
-	mu     sync.Mutex
-	all    []*proxy
-	next   int
-	maxFai int
+	mu   sync.Mutex
+	all  []*proxy
+	seen map[string]bool
+
+	baseBackoff time.Duration
+	maxBackoff  time.Duration
+	limitPause  time.Duration
 }
 
 type proxy struct {
 	scheme string // http, https, socks4, socks5, direct
 	host   string // host:port
 	user   *url.Userinfo
-	fails  int
-	dead   bool
-	ok     int
+
+	cli *http.Client
+
+	mu    sync.Mutex
+	fails int       // consecutive failures
+	ok    int       // lifetime answers
+	until time.Time // paused until this instant
 }
 
 func (p *proxy) key() string { return p.scheme + "://" + p.host }
@@ -43,16 +52,58 @@ func (p *proxy) String() string {
 	return p.key()
 }
 
+// pausedFor reports how long the proxy must still wait before its next request.
+func (p *proxy) pausedFor() time.Duration {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return time.Until(p.until)
+}
+
+// wait sleeps out the proxy's pause, or returns early when ctx ends.
+func (p *proxy) wait(ctx context.Context) error {
+	for {
+		d := p.pausedFor()
+		if d <= 0 {
+			return ctx.Err()
+		}
+		t := time.NewTimer(d)
+		select {
+		case <-ctx.Done():
+			t.Stop()
+			return ctx.Err()
+		case <-t.C:
+		}
+	}
+}
+
 // LoadPool reads scheme://[user:pass@]host:port lines. Bare host:port is http.
-func LoadPool(path string, maxFails int) (*Pool, error) {
+func LoadPool(path string, timeout, baseBackoff, maxBackoff, limitPause time.Duration) (*Pool, error) {
+	pool := &Pool{
+		seen:        map[string]bool{},
+		baseBackoff: baseBackoff,
+		maxBackoff:  maxBackoff,
+		limitPause:  limitPause,
+	}
+	added, err := pool.Reload(path, timeout)
+	if err != nil {
+		return nil, err
+	}
+	if len(added) == 0 {
+		return nil, fmt.Errorf("no usable proxies in %s", path)
+	}
+	return pool, nil
+}
+
+// Reload reads the list again and returns the proxies not seen before. Known
+// entries are untouched: backoff decides when they get another chance.
+func (p *Pool) Reload(path string, timeout time.Duration) ([]*proxy, error) {
 	f, err := os.Open(path)
 	if err != nil {
 		return nil, err
 	}
 	defer f.Close()
 
-	pool := &Pool{maxFai: maxFails}
-	seen := map[string]bool{}
+	var added []*proxy
 	sc := bufio.NewScanner(f)
 	for sc.Scan() {
 		line := strings.TrimSpace(sc.Text())
@@ -76,101 +127,82 @@ func LoadPool(path string, maxFails int) (*Pool, error) {
 			continue
 		}
 		px := &proxy{scheme: scheme, host: u.Host, user: u.User}
-		if seen[px.key()] {
-			continue
-		}
-		seen[px.key()] = true
-		pool.all = append(pool.all, px)
-	}
-	if err := sc.Err(); err != nil {
-		return nil, err
-	}
-	if len(pool.all) == 0 {
-		return nil, fmt.Errorf("no usable proxies in %s", path)
-	}
-	return pool, nil
-}
-
-// Reload merges a refreshed list: unseen entries join, entries that reappear
-// are revived. Nothing is removed.
-func (p *Pool) Reload(path string) (added, revived int, err error) {
-	fresh, err := LoadPool(path, p.maxFai)
-	if err != nil {
-		return 0, 0, err
-	}
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	index := map[string]*proxy{}
-	for _, px := range p.all {
-		index[px.key()] = px
-	}
-	for _, px := range fresh.all {
-		cur, ok := index[px.key()]
-		if !ok {
+		p.mu.Lock()
+		dup := p.seen[px.key()]
+		if !dup {
+			p.seen[px.key()] = true
+			px.cli = px.client(timeout)
 			p.all = append(p.all, px)
-			added++
-			continue
 		}
-		if cur.dead {
-			cur.dead, cur.fails = false, 0
-			revived++
+		p.mu.Unlock()
+		if !dup {
+			added = append(added, px)
 		}
 	}
-	return added, revived, nil
+	return added, sc.Err()
 }
 
-// Next returns the next live proxy, false once every proxy is dead.
-func (p *Pool) Next() (*proxy, bool) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	for i := 0; i < len(p.all); i++ {
-		px := p.all[p.next%len(p.all)]
-		p.next++
-		if !px.dead {
-			return px, true
-		}
-	}
-	return nil, false
-}
-
+// Succeed clears the failure streak.
 func (p *Pool) Succeed(px *proxy) {
-	p.mu.Lock()
+	px.mu.Lock()
 	px.fails, px.ok = 0, px.ok+1
-	p.mu.Unlock()
+	px.mu.Unlock()
 }
 
-func (p *Pool) Fail(px *proxy) {
-	p.mu.Lock()
+// Fail pauses the proxy for base * 2^(fails-1), capped at max. It reports
+// whether the proxy had ever answered, so the caller knows the failure says
+// something about the request and not only about the proxy.
+func (p *Pool) Fail(px *proxy) (proven bool) {
+	px.mu.Lock()
+	proven = px.ok > 0
 	px.fails++
-	if px.fails >= p.maxFai {
-		px.dead = true
+	d := p.baseBackoff << uint(px.fails-1)
+	if d > p.maxBackoff || d <= 0 {
+		d = p.maxBackoff
 	}
-	p.mu.Unlock()
+	px.until = time.Now().Add(d)
+	px.mu.Unlock()
+	return proven
 }
 
-func (p *Pool) Stats() (live, dead int) {
+// Limited pauses a proxy that GitHub rate limited. The proxy works, it just
+// needs a breather; the streak is not touched.
+func (p *Pool) Limited(px *proxy) {
+	px.mu.Lock()
+	if t := time.Now().Add(p.limitPause); t.After(px.until) {
+		px.until = t
+	}
+	px.mu.Unlock()
+}
+
+// Stats counts proxies ready to send against proxies sitting out a pause.
+func (p *Pool) Stats() (live, paused int) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	now := time.Now()
 	for _, px := range p.all {
-		if px.dead {
-			dead++
+		px.mu.Lock()
+		if px.until.After(now) {
+			paused++
 		} else {
 			live++
 		}
+		px.mu.Unlock()
 	}
 	return
 }
 
-// Direct is the local connection, used as a fallback when the rotation cannot
-// answer.
+// Direct is the local connection.
 var Direct = &proxy{scheme: "direct", host: "this machine"}
 
-// client builds a one-proxy http.Client with no connection reuse, so every
-// request leaves through the proxy it was given.
+// client builds a one-proxy http.Client. Connections are reused, so the TLS
+// handshake through a proxy is paid once, not per name.
 func (px *proxy) client(timeout time.Duration) *http.Client {
 	tr := &http.Transport{
-		DisableKeepAlives:   true,
-		TLSHandshakeTimeout: timeout,
+		TLSHandshakeTimeout:   timeout,
+		ResponseHeaderTimeout: timeout,
+		MaxIdleConnsPerHost:   16,
+		IdleConnTimeout:       90 * time.Second,
 	}
 	switch px.scheme {
 	case "direct":

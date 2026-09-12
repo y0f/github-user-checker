@@ -41,16 +41,18 @@ func main() {
 		out        = flag.String("out", "available.txt", "file that collects available names")
 		done       = flag.String("done", "checked.txt", "names already decided, used to resume")
 		proxies    = flag.String("proxies", "proxies.txt", "proxy list, scheme://host:port per line")
-		workers    = flag.Int("workers", 64, "concurrent checks, one proxy per request")
-		timeout    = flag.Duration("timeout", 12*time.Second, "per-request timeout")
-		tries      = flag.Int("tries", 8, "proxy attempts per name before giving up")
-		maxFails   = flag.Int("max-fails", 4, "consecutive failures before a proxy is retired")
+		perProxy   = flag.Int("per-proxy", 4, "concurrent requests through each proxy")
+		timeout    = flag.Duration("timeout", 8*time.Second, "per-request timeout")
+		tries      = flag.Int("tries", 8, "attempts per name before giving up")
+		backoff    = flag.Duration("backoff", 10*time.Second, "pause after a proxy's first failure, doubles each failure in a row")
+		maxBackoff = flag.Duration("max-backoff", 10*time.Minute, "longest pause for a failing proxy")
+		limitPause = flag.Duration("limit-pause", 20*time.Second, "pause for a proxy GitHub answered 429 to")
 		minLen     = flag.Int("min", 2, "minimum name length")
 		maxLen     = flag.Int("max", 8, "maximum name length")
 		letters    = flag.Bool("letters", true, "keep only a-z names, no digits or hyphens")
 		confirm    = flag.Bool("confirm", true, "re-check every hit through a different proxy")
 		dbg        = flag.Bool("debug", false, "print why each proxy attempt was rejected")
-		direct     = flag.Bool("direct", true, "fall back to this machine's own connection when the rotation cannot answer")
+		direct     = flag.Bool("direct", true, "also use this machine's own connection")
 		directRate = flag.Int("direct-rate", 30, "direct requests per minute, 0 for no limit")
 		reload     = flag.Duration("reload", 2*time.Minute, "re-read the proxy list this often, 0 to disable")
 	)
@@ -60,21 +62,25 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	pool, err := LoadPool(*proxies, *maxFails)
+	pool, err := LoadPool(*proxies, *timeout, *backoff, *maxBackoff, *limitPause)
 	switch {
 	case err == nil:
 		live, _ := pool.Stats()
-		fmt.Printf("%d proxies loaded from %s\n", live, *proxies)
+		fmt.Printf("%d proxies loaded from %s, %d workers each\n", live, *proxies, *perProxy)
 	case *direct:
 		fmt.Printf("no proxy list (%v), running direct from this machine\n", err)
 	default:
 		die(err)
 	}
+	if pool == nil {
+		pool = &Pool{seen: map[string]bool{}, baseBackoff: *backoff, maxBackoff: *maxBackoff, limitPause: *limitPause}
+	}
 
 	var fallback *limiter
 	if *direct {
 		fallback = newLimiter(*directRate)
-		fmt.Printf("direct fallback on, limited to %d requests per minute\n", *directRate)
+		Direct.cli = Direct.client(*timeout)
+		fmt.Printf("direct connection on, limited to %d requests per minute\n", *directRate)
 	}
 
 	skip, err := loadSet(*done)
@@ -88,7 +94,7 @@ func main() {
 	if len(skip) > 0 {
 		fmt.Printf("resuming, %d already checked\n", len(skip))
 	}
-	fmt.Printf("checking %d names with %d workers\n", len(names), *workers)
+	fmt.Printf("checking %d names\n", len(names))
 
 	hits, err := os.OpenFile(*out, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
 	if err != nil {
@@ -101,25 +107,24 @@ func main() {
 	}
 	defer log.Close()
 
-	var (
-		mu        sync.Mutex
-		checked   atomic.Int64
-		available atomic.Int64
-		taken     atomic.Int64
-		reserved  atomic.Int64
-		gaveUp    atomic.Int64
-		start     = time.Now()
-	)
-
-	record := func(name string, v verdict) {
-		mu.Lock()
-		defer mu.Unlock()
+	r := &run{
+		pool:    pool,
+		timeout: *timeout,
+		tries:   *tries,
+		confirm: *confirm,
+		queue:   make(chan *job, len(names)),
+		start:   time.Now(),
+		total:   len(names),
+	}
+	r.record = func(name string, v verdict) {
+		r.mu.Lock()
+		defer r.mu.Unlock()
 		if v == vAvailable {
 			if _, err := fmt.Fprintln(hits, name); err != nil {
 				die(fmt.Errorf("writing %s: %w", *out, err))
 			}
 			_ = hits.Sync()
-			fmt.Printf("\r%-90s\r", "")
+			fmt.Printf("\r%-100s\r", "")
 			fmt.Println("available:", name)
 		}
 		if _, err := fmt.Fprintln(log, name); err != nil {
@@ -127,147 +132,199 @@ func main() {
 		}
 	}
 
-	work := make(chan string)
-	var wg sync.WaitGroup
-	for i := 0; i < *workers; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			for name := range work {
-				v := check(ctx, pool, fallback, name, *timeout, *tries)
-				// One yes can still be one lying proxy: a free name must answer twice.
-				if v == vAvailable && *confirm {
-					if again := check(ctx, pool, fallback, name, *timeout, *tries); again != vAvailable {
-						v = again
-					}
-				}
-				switch v {
-				case vAvailable:
-					available.Add(1)
-				case vTaken:
-					taken.Add(1)
-				case vReserved:
-					reserved.Add(1)
-				default:
-					v = vRetry
-					gaveUp.Add(1)
-				}
-				if v != vRetry {
-					record(name, v)
-				}
-				checked.Add(1)
-			}
-		}()
+	// Every name is a job. It sits in the queue or in one worker's hands until
+	// decided, then the pending group shrinks by one.
+	r.pending.Add(len(names))
+	for _, n := range names {
+		r.queue <- &job{name: n}
 	}
 
-	progress := func(end string) {
-		var l, d int
-		if pool != nil {
-			l, d = pool.Stats()
+	// Workers stop when every job is decided or the user interrupts.
+	wctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	var workers sync.WaitGroup
+	spawn := func(px *proxy, n int, lim *limiter) {
+		for i := 0; i < n; i++ {
+			workers.Add(1)
+			go func() {
+				defer workers.Done()
+				r.worker(wctx, px, lim)
+			}()
 		}
-		fmt.Printf("\rchecked %d/%d  available %d  taken %d  reserved %d  gaveup %d  proxies %d live %d dead   %s",
-			checked.Load(), len(names), available.Load(), taken.Load(),
-			reserved.Load(), gaveUp.Load(), l, d, end)
 	}
-	if pool != nil && *reload > 0 {
+	pool.mu.Lock()
+	all := append([]*proxy(nil), pool.all...)
+	pool.mu.Unlock()
+	for _, px := range all {
+		spawn(px, *perProxy, nil)
+	}
+	if *direct {
+		spawn(Direct, 1, fallback)
+	}
+
+	if *reload > 0 {
 		go func() {
 			t := time.NewTicker(*reload)
 			defer t.Stop()
 			for {
 				select {
-				case <-ctx.Done():
+				case <-wctx.Done():
 					return
 				case <-t.C:
-					added, revived, err := pool.Reload(*proxies)
-					if err == nil && added+revived > 0 {
-						fmt.Printf("\r%-90s\rproxy list reloaded: %d new, %d revived\n", "", added, revived)
+					added, err := pool.Reload(*proxies, *timeout)
+					if err != nil || len(added) == 0 {
+						continue
 					}
+					for _, px := range added {
+						spawn(px, *perProxy, nil)
+					}
+					fmt.Printf("\r%-100s\rproxy list reloaded: %d new\n", "", len(added))
 				}
 			}
 		}()
 	}
 
-	finished := make(chan struct{})
-	ticker := time.NewTicker(500 * time.Millisecond)
 	go func() {
-		defer ticker.Stop()
+		t := time.NewTicker(500 * time.Millisecond)
+		defer t.Stop()
 		for {
 			select {
-			case <-finished:
+			case <-wctx.Done():
 				return
-			case <-ticker.C:
-			}
-			progress("")
-			if pool == nil || *direct {
-				continue
-			}
-			if l, d := pool.Stats(); l == 0 {
-				fmt.Printf("\rall %d proxies are dead, stopping%-40s\n", d, "")
-				fmt.Println("refresh the list with proxies that can CONNECT to https targets")
-				stop()
-				return
+			case <-t.C:
+				r.progress("")
 			}
 		}
 	}()
 
-feed:
-	for _, n := range names {
-		select {
-		case work <- n:
-		case <-ctx.Done():
-			break feed
-		}
+	finished := make(chan struct{})
+	go func() {
+		r.pending.Wait()
+		close(finished)
+	}()
+	select {
+	case <-finished:
+	case <-ctx.Done():
 	}
-	close(work)
-	wg.Wait()
-	close(finished)
+	cancel()
+	workers.Wait()
 
-	progress("\n")
+	r.progress("\n")
 	fmt.Printf("done in %s, %d available written to %s\n",
-		time.Since(start).Round(time.Second), available.Load(), *out)
+		time.Since(r.start).Round(time.Second), r.available.Load(), *out)
 }
 
-// check walks the rotation until a proxy relays a real GitHub answer, then
-// falls back to the local connection.
-func check(ctx context.Context, pool *Pool, fallback *limiter, name string, timeout time.Duration, tries int) verdict {
-	for i := 0; pool != nil && i < tries; i++ {
-		if ctx.Err() != nil {
-			return vRetry
-		}
-		px, ok := pool.Next()
-		if !ok {
-			break
-		}
-		v, err := ask(ctx, px, name, timeout)
-		if debug && (err != nil || v == vRetry || v == vLimited) {
-			fmt.Printf("\r%-90s\rdebug %s via %s: verdict=%d err=%v\n", "", name, px, v, err)
-		}
-		switch {
-		case ctx.Err() != nil:
-			// Cancelled mid-request: not the proxy's fault.
-			return vRetry
-		case v == vLimited:
-			// GitHub answered, so the proxy works. Move on without punishing it.
-			continue
-		case err != nil || v == vRetry:
-			pool.Fail(px)
-			continue
-		}
-		pool.Succeed(px)
-		return v
-	}
+// job is one name on its way to a verdict.
+type job struct {
+	name    string
+	tries   int    // attempts that produced no trustworthy answer
+	yesFrom *proxy // proxy that said available; a second proxy must agree
+}
 
-	if fallback == nil || ctx.Err() != nil {
-		return vRetry
+type run struct {
+	pool    *Pool
+	timeout time.Duration
+	tries   int
+	confirm bool
+	queue   chan *job
+	record  func(string, verdict)
+
+	mu        sync.Mutex
+	pending   sync.WaitGroup
+	start     time.Time
+	total     int
+	checked   atomic.Int64
+	available atomic.Int64
+	taken     atomic.Int64
+	reserved  atomic.Int64
+	gaveUp    atomic.Int64
+}
+
+func (r *run) progress(end string) {
+	l, p := r.pool.Stats()
+	c := r.checked.Load()
+	rate := float64(c) / time.Since(r.start).Seconds()
+	fmt.Printf("\rchecked %d/%d  available %d  taken %d  reserved %d  gaveup %d  proxies %d live %d paused  %.1f/s   %s",
+		c, r.total, r.available.Load(), r.taken.Load(),
+		r.reserved.Load(), r.gaveUp.Load(), l, p, rate, end)
+}
+
+func (r *run) decide(j *job, v verdict) {
+	switch v {
+	case vAvailable:
+		r.available.Add(1)
+	case vTaken:
+		r.taken.Add(1)
+	case vReserved:
+		r.reserved.Add(1)
+	default:
+		r.gaveUp.Add(1)
+		r.checked.Add(1)
+		r.pending.Done()
+		return
 	}
-	if err := fallback.wait(ctx); err != nil {
-		return vRetry
+	r.record(j.name, v)
+	r.checked.Add(1)
+	r.pending.Done()
+}
+
+// worker pulls jobs through one proxy until the context ends. It sleeps
+// through the proxy's pauses, so a dead proxy costs nothing but its own time.
+func (r *run) worker(ctx context.Context, px *proxy, lim *limiter) {
+	for {
+		if px.wait(ctx) != nil {
+			return
+		}
+		if lim != nil && lim.wait(ctx) != nil {
+			return
+		}
+		var j *job
+		select {
+		case <-ctx.Done():
+			return
+		case j = <-r.queue:
+		}
+		if j.yesFrom == px {
+			// This proxy already said yes; hand the job to another one.
+			r.queue <- j
+			time.Sleep(50 * time.Millisecond)
+			continue
+		}
+
+		v, err := ask(ctx, px, j.name, r.timeout)
+		if debug && (err != nil || v == vRetry || v == vLimited) {
+			fmt.Printf("\r%-100s\rdebug %s via %s: verdict=%d err=%v\n", "", j.name, px, v, err)
+		}
+		if ctx.Err() != nil {
+			r.queue <- j
+			return
+		}
+
+		switch {
+		case v == vLimited:
+			r.pool.Limited(px)
+			j.tries++
+		case err != nil || v == vRetry:
+			// A proxy that never answered anything is junk, not evidence
+			// about this name. Only a proven proxy's failure counts.
+			if r.pool.Fail(px) {
+				j.tries++
+			}
+		case v == vAvailable && r.confirm && j.yesFrom == nil:
+			// One yes can still be one lying proxy: a free name must answer twice.
+			r.pool.Succeed(px)
+			j.yesFrom = px
+		default:
+			r.pool.Succeed(px)
+			r.decide(j, v)
+			continue
+		}
+		if j.tries >= r.tries {
+			r.decide(j, vRetry)
+			continue
+		}
+		r.queue <- j
 	}
-	v, err := ask(ctx, Direct, name, timeout)
-	if err != nil && debug {
-		fmt.Printf("\r%-90s\rdebug %s direct: %v\n", "", name, err)
-	}
-	return v
 }
 
 type limiter struct{ tick <-chan time.Time }
@@ -310,7 +367,7 @@ func ask(ctx context.Context, px *proxy, name string, timeout time.Duration) (ve
 	req.Header.Set("Sec-Fetch-Mode", "cors")
 	req.Header.Set("Sec-Fetch-Dest", "empty")
 
-	resp, err := px.client(timeout).Do(req)
+	resp, err := px.cli.Do(req)
 	if err != nil {
 		return vRetry, err
 	}
