@@ -5,3 +5,8 @@ checked.txt
 *-available.txt
 *.exe
 run.log
+available*.txt
+checked*.txt
+*.backup.*.txt
+run*.log
+wordlists/3and4char.txt

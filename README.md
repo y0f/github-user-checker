@@ -14,13 +14,17 @@ limit. Free names go to text file.
 | `zzzqqxxwv` | 404 | 404 | free |
 
 Same answer, different truth. This tool asks what signup form asks,
-`github.com/signup_check/username?value=<name>`. Three answers:
+`github.com/signup_check_new/username?value=<name>`. Three answers:
 
 - `200` + `<name> is available.` → free
 - `422` + `Username <name> is not available.` → taken
 - `422` + `Username '<name>' is unavailable.` → reserved
 
-Verified live 2026-09-09.
+Verified live 2026-10-29. Until late October 2026 the endpoint was
+`signup_check/username`; that path now answers `404` to every name. If GitHub
+moves it again, the run stops after 20 GitHub `404`s in a row and says so,
+instead of retrying forever. Find the new path in the browser network tab on
+`github.com/signup` while typing a name.
 
 ## No false positives
 
@@ -28,6 +32,13 @@ Verified live 2026-09-09.
    No header → answer thrown away, name retried elsewhere.
 2. Every hit re-checked through second route before written. One yes not enough.
 3. GitHub `429` is real answer, not proxy fault. Proxy stays, name moves on.
+
+## Speed
+
+GitHub allows about 9 checks per minute per IP, then answers `429` for about
+a minute (measured 2026-10-29, no `Retry-After` header). Speed is therefore
+roughly working proxies × 9 per minute: 20 live proxies ≈ 3 names/s. More
+names per second needs more distinct exit IPs, not more workers.
 4. Names breaking GitHub rules (leading/trailing/double hyphen, >39 chars)
    dropped before request spent.
 
@@ -59,7 +70,7 @@ run again, resumes.
 | `-tries` | `8` | failures from proven proxies (or `429`s) per name before giving up |
 | `-backoff` | `10s` | pause after a proxy fails, doubles each failure in a row |
 | `-max-backoff` | `10m` | longest pause for a failing proxy |
-| `-limit-pause` | `20s` | pause for a proxy GitHub answered `429` to |
+| `-limit-pause` | `1m` | pause for a proxy GitHub answered `429` to |
 | `-reload` | `2m` | re-read proxy list this often, `0` off |
 | `-min` / `-max` | `2` / `8` | name length filter |
 | `-letters` | `true` | keep only `a-z` |
@@ -96,5 +107,5 @@ One address, nothing behind it.
 ## Notes
 
 - Endpoint answers `406` to any `Accept` list. Send exactly one:
-  `text/fragment+html`.
+  `text/fragment+html` (`*/*` works too).
 - Reserved counted separate from taken. Neither written to output.

@@ -2,7 +2,7 @@
 // registered, one rotating proxy per request.
 //
 // A 404 on github.com/<name> is not proof of a free name: "admin" 404s on both
-// the web page and the API, yet signup rejects it. Only /signup_check/username
+// the web page and the API, yet signup rejects it. Only /signup_check_new/username
 // separates free, taken and reserved.
 package main
 
@@ -33,7 +33,12 @@ const (
 	vAvailable                // 200, "<name> is available."
 	vTaken                    // 422, "Username <name> is not available."
 	vReserved                 // 422, "Username 'x' is unavailable."
+	vGone                     // GitHub 404: the endpoint moved, every name will fail
 )
+
+// goneLimit is how many GitHub 404s in a row stop the run: one can be a fluke,
+// a streak means the endpoint moved (signup_check -> signup_check_new, Oct 2026).
+const goneLimit = 20
 
 func main() {
 	var (
@@ -46,7 +51,7 @@ func main() {
 		tries      = flag.Int("tries", 8, "attempts per name before giving up")
 		backoff    = flag.Duration("backoff", 10*time.Second, "pause after a proxy's first failure, doubles each failure in a row")
 		maxBackoff = flag.Duration("max-backoff", 10*time.Minute, "longest pause for a failing proxy")
-		limitPause = flag.Duration("limit-pause", 20*time.Second, "pause for a proxy GitHub answered 429 to")
+		limitPause = flag.Duration("limit-pause", time.Minute, "pause for a proxy GitHub answered 429 to; the block lasts about a minute")
 		minLen     = flag.Int("min", 2, "minimum name length")
 		maxLen     = flag.Int("max", 8, "maximum name length")
 		letters    = flag.Bool("letters", true, "keep only a-z names, no digits or hyphens")
@@ -142,6 +147,7 @@ func main() {
 	// Workers stop when every job is decided or the user interrupts.
 	wctx, cancel := context.WithCancel(ctx)
 	defer cancel()
+	r.abort = cancel
 	var workers sync.WaitGroup
 	spawn := func(px *proxy, n int, lim *limiter) {
 		for i := 0; i < n; i++ {
@@ -205,9 +211,15 @@ func main() {
 	select {
 	case <-finished:
 	case <-ctx.Done():
+	case <-wctx.Done():
 	}
 	cancel()
 	workers.Wait()
+	if r.gone.Load() >= goneLimit {
+		r.progress("\n")
+		die(fmt.Errorf("GitHub answered 404 %d times in a row: the signup check endpoint moved again. "+
+			"Open github.com/signup, type a username and look in the network tab for the new URL", goneLimit))
+	}
 
 	r.progress("\n")
 	fmt.Printf("done in %s, %d available written to %s\n",
@@ -228,6 +240,9 @@ type run struct {
 	confirm bool
 	queue   chan *job
 	record  func(string, verdict)
+
+	gone  atomic.Int64 // GitHub 404s in a row
+	abort context.CancelFunc
 
 	mu        sync.Mutex
 	pending   sync.WaitGroup
@@ -300,7 +315,18 @@ func (r *run) worker(ctx context.Context, px *proxy, lim *limiter) {
 			return
 		}
 
+		if v != vGone && v != vRetry && err == nil {
+			r.gone.Store(0)
+		}
 		switch {
+		case v == vGone:
+			// GitHub answered, so the proxy is fine; the URL is not.
+			r.pool.Succeed(px)
+			if r.gone.Add(1) >= goneLimit {
+				r.queue <- j
+				r.abort()
+				return
+			}
 		case v == vLimited:
 			r.pool.Limited(px)
 			j.tries++
@@ -353,7 +379,7 @@ func ask(ctx context.Context, px *proxy, name string, timeout time.Duration) (ve
 	defer cancel()
 
 	req, err := http.NewRequestWithContext(rctx, http.MethodGet,
-		"https://github.com/signup_check/username?value="+url.QueryEscape(name), nil)
+		"https://github.com/signup_check_new/username?value="+url.QueryEscape(name), nil)
 	if err != nil {
 		return vRetry, err
 	}
@@ -394,6 +420,8 @@ func ask(ctx context.Context, px *proxy, name string, timeout time.Duration) (ve
 
 	text := string(body)
 	switch {
+	case resp.StatusCode == http.StatusNotFound:
+		return vGone, nil
 	case resp.StatusCode == http.StatusTooManyRequests:
 		return vLimited, nil
 	case resp.StatusCode == http.StatusOK && strings.Contains(text, "is available."):
